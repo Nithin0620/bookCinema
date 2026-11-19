@@ -1,16 +1,67 @@
 services:
+  app:
+    build: .
+    container_name: bookcinema-app
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ADDR: ":8080"
+      DATABASE_URL: "postgres://cinema:cinema@postgres:5432/cinema?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      HOLD_TTL: "2m"
+      SESSION_TTL: "168h"
+      COOKIE_SECURE: "false"
+      STATIC_DIR: "web/dist"
+      ADMIN_EMAILS: "${ADMIN_EMAILS:-admin@example.com}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bookcinema-postgres
+    environment:
+      POSTGRES_USER: cinema
+      POSTGRES_PASSWORD: cinema
+      POSTGRES_DB: cinema
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinema -d cinema"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   redis:
-    container_name: redis
     image: redis:7-alpine
+    container_name: bookcinema-redis
     ports:
       - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   redis-commander:
-    container_name: redis-commander
-    hostname: redis-commander
     image: rediscommander/redis-commander:latest
+    container_name: bookcinema-redis-commander
     restart: always
     environment:
       - REDIS_HOSTS=local:redis:6379
     ports:
       - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
     user: redis
+
+volumes:
+  postgres_data:
+  redis_data:

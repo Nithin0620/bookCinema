@@ -3,162 +3,146 @@ package booking
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 )
 
-const defaultHoldTTL = 2 * time.Minute
+const holdKeyPrefix = "hold:"
 
-// RedisStore implements session-based seat booking backed by Redis.
-//
-// Key design:
-//
-//	seat:{movieID}:{seatID}   → session JSON (TTL = held, no TTL = confirmed)
-//	session:{sessionID}       → seat key     (reverse lookup)
-type RedisStore struct {
-	rdb *redis.Client
+var (
+	createHoldScript = goredis.NewScript(`
+local ok = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2]))
+if not ok then return 0 end
+redis.call('SET', KEYS[2], KEYS[1], 'EX', tonumber(ARGV[2]))
+return 1
+`)
+
+	getHoldScript = goredis.NewScript(`
+local seatKey = redis.call('GET', KEYS[1])
+if not seatKey then return nil end
+local payload = redis.call('GET', seatKey)
+if not payload then
+  redis.call('DEL', KEYS[1])
+  return nil
+end
+return payload
+`)
+
+	deleteHoldScript = goredis.NewScript(`
+local seatKey = redis.call('GET', KEYS[1])
+if seatKey then redis.call('DEL', seatKey) end
+return redis.call('DEL', KEYS[1])
+`)
+)
+
+type RedisHoldStore struct {
+	rdb     *goredis.Client
+	holdTTL time.Duration
 }
 
-func NewRedisStore(rdb *redis.Client) *RedisStore {
-	return &RedisStore{rdb: rdb}
+func NewRedisHoldStore(rdb *goredis.Client, holdTTL time.Duration) *RedisHoldStore {
+	return &RedisHoldStore{rdb: rdb, holdTTL: holdTTL}
 }
 
-// sessionKey builds the reverse-lookup key for a session.
-func sessionKey(id string) string {
-	return fmt.Sprintf("session:%s", id)
-}
-
-func (s *RedisStore) Book(b Booking) (Booking, error) {
-	session, err := s.hold(b)
+func (s *RedisHoldStore) Create(ctx context.Context, hold Hold) (Hold, error) {
+	payload, err := json.Marshal(hold)
 	if err != nil {
-		return Booking{}, err
+		return Hold{}, fmt.Errorf("marshal hold: %w", err)
 	}
 
-	log.Printf("Session booked %v", session)
+	seatKey := holdKey(hold.ShowtimeID, hold.SeatID)
+	sessionKey := sessionKey(hold.ID)
+	ttl := int(s.holdTTL.Seconds())
 
-	return session, nil
-}
-
-func (s *RedisStore) ListBookings(movieID string) []Booking {
-	pattern := fmt.Sprintf("seat:%s:*", movieID)
-	var sessions []Booking
-
-	ctx := context.Background()
-
-	iter := s.rdb.Scan(ctx, 0, pattern, 0).Iterator()
-	for iter.Next(ctx) {
-		val, err := s.rdb.Get(ctx, iter.Val()).Result()
-		if err != nil {
-			continue
-		}
-		session, err := parseSession(val)
-		if err != nil {
-			continue
-		}
-		sessions = append(sessions, session)
-	}
-
-	return sessions
-}
-
-func (s *RedisStore) hold(b Booking) (Booking, error) {
-	id := uuid.New().String()
-	now := time.Now()
-	ctx := context.Background()
-	key := fmt.Sprintf("seat:%s:%s", b.MovieID, b.SeatID)
-
-	b.ID = id
-	val, _ := json.Marshal(b)
-
-	res := s.rdb.SetArgs(ctx, key, val, redis.SetArgs{
-		Mode: "NX", // set if not exists
-		TTL:  defaultHoldTTL,
-	})
-	ok := res.Val() == "OK"
-	if !ok {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-
-	s.rdb.Set(ctx, sessionKey(id), key, defaultHoldTTL)
-
-	return Booking{
-		ID:        id,
-		MovieID:   b.MovieID,
-		SeatID:    b.SeatID,
-		UserID:    b.UserID,
-		Status:    "held",
-		ExpiresAt: now.Add(defaultHoldTTL),
-	}, nil
-}
-
-func parseSession(val string) (Booking, error) {
-	var data Booking
-	if err := json.Unmarshal([]byte(val), &data); err != nil {
-		return Booking{}, err
-	}
-	return Booking{
-		ID:      data.ID,
-		MovieID: data.MovieID,
-		SeatID:  data.SeatID,
-		UserID:  data.UserID,
-		Status:  data.Status,
-	}, nil
-}
-
-// Confirm converts a held session into a permanent booking.
-// Removes the TTL (PERSIST) so the key never expires.
-func (s *RedisStore) Confirm(ctx context.Context, sessionID string, userID string) (Booking, error) {
-	session, sk, err := s.getSession(ctx, sessionID, userID)
+	created, err := createHoldScript.Run(ctx, s.rdb, []string{seatKey, sessionKey}, string(payload), ttl).Int()
 	if err != nil {
-		return Booking{}, err
+		return Hold{}, fmt.Errorf("create hold: %w", err)
+	}
+	if created == 0 {
+		return Hold{}, ErrSeatAlreadyBooked
 	}
 
-	s.rdb.Persist(ctx, sk)
-	s.rdb.Persist(ctx, sessionKey(sessionID))
-
-	session.Status = "confirmed"
-	data := Booking{
-		ID:      session.ID,
-		MovieID: string(session.MovieID),
-		SeatID:  session.SeatID,
-		UserID:  session.UserID,
-		Status:  "confirmed",
-	}
-	val, _ := json.Marshal(data)
-	s.rdb.Set(ctx, sk, val, 0)
-
-	return session, nil
+	hold.ExpiresAt = time.Now().Add(s.holdTTL)
+	return hold, nil
 }
 
-func (s *RedisStore) getSession(ctx context.Context, sessionID string, userID string) (Booking, string, error) {
-	sk, err := s.rdb.Get(ctx, sessionKey(sessionID)).Result()
+func (s *RedisHoldStore) GetOwned(ctx context.Context, sessionID, userID string) (Hold, error) {
+	payload, err := getHoldScript.Run(ctx, s.rdb, []string{sessionKey(sessionID)}).Text()
+	if errors.Is(err, goredis.Nil) {
+		return Hold{}, ErrInvalidSession
+	}
 	if err != nil {
-		return Booking{}, "", err
+		return Hold{}, fmt.Errorf("get hold: %w", err)
 	}
 
-	val, err := s.rdb.Get(ctx, sk).Result()
+	hold, err := parseHold([]byte(payload))
 	if err != nil {
-		return Booking{}, "", err
+		return Hold{}, ErrInvalidSession
 	}
-
-	session, err := parseSession(val)
-	if err != nil {
-		return Booking{}, "", err
+	if hold.UserID != userID {
+		return Hold{}, ErrNotOwner
 	}
-
-	return session, sk, nil
+	return hold, nil
 }
 
-func (s *RedisStore) Release(ctx context.Context, sessionID string, userID string) error {
-	_, sk, err := s.getSession(ctx, sessionID, userID)
-	if err != nil {
+func (s *RedisHoldStore) DeleteOwned(ctx context.Context, sessionID, userID string) error {
+	if _, err := s.GetOwned(ctx, sessionID, userID); err != nil {
 		return err
 	}
-
-	s.rdb.Del(ctx, sk, sessionKey(sessionID))
+	if err := deleteHoldScript.Run(ctx, s.rdb, []string{sessionKey(sessionID)}).Err(); err != nil {
+		return fmt.Errorf("delete hold: %w", err)
+	}
 	return nil
 }
+
+func (s *RedisHoldStore) DeleteManyOwned(ctx context.Context, sessionIDs []string, userID string) error {
+	for _, id := range sessionIDs {
+		if err := s.DeleteOwned(ctx, id, userID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *RedisHoldStore) ListByShowtime(ctx context.Context, showtimeID string) ([]Hold, error) {
+	pattern := fmt.Sprintf("%s%s:*", holdKeyPrefix, showtimeID)
+	iter := s.rdb.Scan(ctx, 0, pattern, 100).Iterator()
+
+	holds := []Hold{}
+	for iter.Next(ctx) {
+		payload, err := s.rdb.Get(ctx, iter.Val()).Bytes()
+		if err != nil {
+			continue
+		}
+		hold, err := parseHold(payload)
+		if err != nil {
+			continue
+		}
+		holds = append(holds, hold)
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan holds: %w", err)
+	}
+	return holds, nil
+}
+
+func holdKey(showtimeID, seatID string) string {
+	return fmt.Sprintf("%s%s:%s", holdKeyPrefix, showtimeID, seatID)
+}
+
+func sessionKey(sessionID string) string {
+	return "session:" + sessionID
+}
+
+func parseHold(payload []byte) (Hold, error) {
+	var hold Hold
+	if err := json.Unmarshal(payload, &hold); err != nil {
+		return Hold{}, err
+	}
+	return hold, nil
+}
+
+var _ HoldStore = (*RedisHoldStore)(nil)
